@@ -1,10 +1,5 @@
 import Phaser from 'phaser';
-
-export interface Enemy extends Phaser.GameObjects.GameObject {
-    x: number;
-    y: number;
-    takeDamage: (amount: number) => void;
-}
+import type { Enemy } from './Enemy.ts';
 
 export interface Weapon {
     update(time: number, delta: number, owner: Phaser.GameObjects.Image): void;
@@ -52,15 +47,15 @@ class RapidBlaster implements Weapon {
 }
 
 class AutoTurret implements Weapon {
-    scene: Phaser.Scene;
     lastFired: number = 0;
     fireRate: number = 1000;
     range: number = 250;
     spawner: ProjectileSpawner;
+    enemies: Phaser.GameObjects.Group;
 
-    constructor(scene: Phaser.Scene, spawner: ProjectileSpawner) {
-        this.scene = scene;
+    constructor(spawner: ProjectileSpawner, enemies: Phaser.GameObjects.Group) {
         this.spawner = spawner;
+        this.enemies = enemies;
     }
 
     update(time: number, _delta: number, owner: Phaser.GameObjects.Image) {
@@ -78,18 +73,17 @@ class AutoTurret implements Weapon {
     }
 
     private findClosestEnemy(owner: Phaser.GameObjects.Image): Enemy | null {
-        const enemies = (this.scene as any).enemies as Phaser.GameObjects.Group;
-        if (!enemies) return null;
         let closest: Enemy | null = null;
         let minDist = this.range;
-        enemies.getChildren().forEach((child) => {
-            const enemy = child as unknown as Enemy;
+        for (const child of this.enemies.getChildren()) {
+            const enemy = child as Enemy;
+            if (!enemy.active) continue;
             const dist = Phaser.Math.Distance.Between(owner.x, owner.y, enemy.x, enemy.y);
             if (dist < minDist) {
                 minDist = dist;
                 closest = enemy;
             }
-        });
+        }
         return closest;
     }
 }
@@ -133,6 +127,7 @@ export class SnakePlayer {
     /** Head positions, newest first. path[0] is always the current head position. */
     path: { x: number; y: number }[] = [];
     private spawner: ProjectileSpawner;
+    private enemies: Phaser.GameObjects.Group;
     private worldBounds: Phaser.Geom.Rectangle;
 
     constructor(
@@ -140,10 +135,12 @@ export class SnakePlayer {
         x: number,
         y: number,
         spawner: ProjectileSpawner,
+        enemies: Phaser.GameObjects.Group,
         worldBounds: Phaser.Geom.Rectangle,
     ) {
         this.scene = scene;
         this.spawner = spawner;
+        this.enemies = enemies;
         this.worldBounds = worldBounds;
         this.head = this.scene.add.image(x, y, 'snake-head');
         this.head.setDepth(10);
@@ -183,7 +180,7 @@ export class SnakePlayer {
             segment.setDepth(10 - (i + 1));
             this.segments.push(segment);
             if (i === 0) this.weapons.push(new RapidBlaster(this.spawner));
-            else if (i === 1) this.weapons.push(new AutoTurret(this.scene, this.spawner));
+            else if (i === 1) this.weapons.push(new AutoTurret(this.spawner, this.enemies));
             else if (i === 2) this.weapons.push(new OrbitingBlade(this.scene));
             else this.weapons.push(null);
         }

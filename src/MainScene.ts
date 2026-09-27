@@ -21,9 +21,21 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
   private hpText!: Phaser.GameObjects.Text;
   private swarmText!: Phaser.GameObjects.Text;
   private dead = false;
+  /** Last HUD values drawn, so text is only rebuilt when something changes. */
+  private hudKey = '';
 
   constructor() {
     super({ key: 'MainScene' });
+  }
+
+  /** Runs on first start and on every restart (the scene instance is reused). */
+  init() {
+    this.spawnAcc = 0;
+    this.playerHp = PLAYER_MAX_HP;
+    this.iFrameUntil = 0;
+    this.kills = 0;
+    this.dead = false;
+    this.hudKey = '';
   }
 
   preload() {}
@@ -37,6 +49,8 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
     this.enemies = this.add.group();
     this.projectiles = this.physics.add.group({ allowGravity: false });
     this.physics.add.overlap(this.projectiles, this.enemies, this.onProjectileHit, undefined, this);
+    // Enemies push each other apart instead of stacking into one blob.
+    this.physics.add.collider(this.enemies, this.enemies);
     this.events.on('blade_created', this.onBladeCreated, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.events.off('blade_created', this.onBladeCreated, this);
@@ -47,6 +61,7 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
       WORLD / 2,
       WORLD / 2,
       this,
+      this.enemies,
       new Phaser.Geom.Rectangle(0, 0, WORLD, WORLD),
     );
 
@@ -224,7 +239,7 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
     this.dead = true;
     this.enemies.clear(true, true);
     this.add
-      .text(this.scale.width / 2, this.scale.height / 2, 'DOWN\nRefresh to run again', {
+      .text(this.scale.width / 2, this.scale.height / 2, `DOWN  ·  ${this.kills} kills\nPress R to restart`, {
         fontFamily: 'Courier New, monospace',
         fontSize: '22px',
         color: '#f3ebe6',
@@ -235,9 +250,13 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
       .setOrigin(0.5)
       .setScrollFactor(0)
       .setDepth(120);
+    this.input.keyboard?.once('keydown-R', () => this.scene.restart());
   }
 
   private refreshHud() {
+    const key = `${this.playerHp}|${this.kills}|${this.enemies.getLength()}`;
+    if (key === this.hudKey) return;
+    this.hudKey = key;
     this.hpText.setText(
       `VAMPIRE SNAKE  ·  PHASE 3\nHP  ${this.playerHp}/${PLAYER_MAX_HP}   KILLS  ${this.kills}`,
     );
@@ -247,29 +266,36 @@ export class MainScene extends Phaser.Scene implements ProjectileSpawner {
   }
 
   private makeSnakeTextures() {
-    const headGraphics = this.make.graphics({ x: 0, y: 0, add: false });
+    // Textures live in the game-wide texture manager, so they survive restarts.
+    if (this.textures.exists('snake-head')) return;
+    const headGraphics = this.make.graphics({ x: 0, y: 0 }, false);
     headGraphics.fillStyle(0x39ff14, 1);
     headGraphics.fillCircle(16, 16, 16);
     headGraphics.lineStyle(2, 0x1d8a0b, 1);
     headGraphics.strokeCircle(16, 16, 15);
     headGraphics.generateTexture('snake-head', 32, 32);
+    headGraphics.destroy();
 
-    const bodyGraphics = this.make.graphics({ x: 0, y: 0, add: false });
+    const bodyGraphics = this.make.graphics({ x: 0, y: 0 }, false);
     bodyGraphics.fillStyle(0xff5722, 1);
     bodyGraphics.fillCircle(12, 12, 12);
     bodyGraphics.lineStyle(1.5, 0xbf360c, 1);
     bodyGraphics.strokeCircle(12, 12, 11);
     bodyGraphics.generateTexture('snake-body', 24, 24);
+    bodyGraphics.destroy();
   }
 
   private createGridBackground() {
     const cellSize = 64;
-    const gridGraphics = this.make.graphics({ x: 0, y: 0, add: false });
-    gridGraphics.fillStyle(0x181818, 1);
-    gridGraphics.fillRect(0, 0, cellSize, cellSize);
-    gridGraphics.lineStyle(1, 0x242424, 1);
-    gridGraphics.strokeRect(0, 0, cellSize, cellSize);
-    gridGraphics.generateTexture('grid-cell', cellSize, cellSize);
+    if (!this.textures.exists('grid-cell')) {
+      const gridGraphics = this.make.graphics({ x: 0, y: 0 }, false);
+      gridGraphics.fillStyle(0x181818, 1);
+      gridGraphics.fillRect(0, 0, cellSize, cellSize);
+      gridGraphics.lineStyle(1, 0x242424, 1);
+      gridGraphics.strokeRect(0, 0, cellSize, cellSize);
+      gridGraphics.generateTexture('grid-cell', cellSize, cellSize);
+      gridGraphics.destroy();
+    }
     const bg = this.add.tileSprite(WORLD / 2, WORLD / 2, WORLD, WORLD, 'grid-cell');
     bg.setDepth(-10);
   }

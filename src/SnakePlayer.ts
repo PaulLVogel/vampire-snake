@@ -10,31 +10,44 @@ export interface Weapon {
     update(time: number, delta: number, owner: Phaser.GameObjects.Image): void;
 }
 
+/** Spawns a pooled player projectile. Implemented by the scene. */
+export interface ProjectileSpawner {
+    fireProjectile(opts: {
+        x: number;
+        y: number;
+        angle: number;
+        speed: number;
+        radius: number;
+        color: number;
+        damage: number;
+        lifetimeMs?: number;
+    }): void;
+}
+
+/** Distance between consecutive body segments along the path, in px. */
+export const SEGMENT_SPACING = 28;
+/** Minimum head travel before a new path point is recorded, in px. */
+const PATH_MIN_STEP = 2;
+const HEAD_RADIUS = 16;
+
 class RapidBlaster implements Weapon {
-    scene: Phaser.Scene;
     lastFired: number = 0;
     fireRate: number = 300;
 
-    constructor(scene: Phaser.Scene) {
-        this.scene = scene;
+    spawner: ProjectileSpawner;
+
+    constructor(spawner: ProjectileSpawner) {
+        this.spawner = spawner;
     }
 
     update(time: number, _delta: number, owner: Phaser.GameObjects.Image) {
         if (time > this.lastFired + this.fireRate) {
-            this.fire(owner);
+            this.spawner.fireProjectile({
+                x: owner.x, y: owner.y, angle: owner.rotation,
+                speed: 600, radius: 4, color: 0x39ff14, damage: 10,
+            });
             this.lastFired = time;
         }
-    }
-
-    private fire(owner: Phaser.GameObjects.Image) {
-        const angle = owner.rotation;
-        const projectile = this.scene.add.circle(owner.x, owner.y, 4, 0x39ff14);
-        this.scene.physics.add.existing(projectile);
-        const body = projectile.body as Phaser.Physics.Arcade.Body;
-        const speed = 600;
-        body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
-        this.scene.time.delayedCall(2000, () => projectile.destroy());
-        this.scene.events.emit('player_projectile_fired', projectile, 10);
     }
 }
 
@@ -43,16 +56,22 @@ class AutoTurret implements Weapon {
     lastFired: number = 0;
     fireRate: number = 1000;
     range: number = 250;
+    spawner: ProjectileSpawner;
 
-    constructor(scene: Phaser.Scene) {
+    constructor(scene: Phaser.Scene, spawner: ProjectileSpawner) {
         this.scene = scene;
+        this.spawner = spawner;
     }
 
     update(time: number, _delta: number, owner: Phaser.GameObjects.Image) {
         if (time > this.lastFired + this.fireRate) {
             const target = this.findClosestEnemy(owner);
             if (target) {
-                this.fire(owner, target);
+                this.spawner.fireProjectile({
+                    x: owner.x, y: owner.y,
+                    angle: Phaser.Math.Angle.Between(owner.x, owner.y, target.x, target.y),
+                    speed: 400, radius: 6, color: 0x00ccff, damage: 25,
+                });
                 this.lastFired = time;
             }
         }
@@ -72,17 +91,6 @@ class AutoTurret implements Weapon {
             }
         });
         return closest;
-    }
-
-    private fire(owner: Phaser.GameObjects.Image, target: Enemy) {
-        const angle = Phaser.Math.Angle.Between(owner.x, owner.y, target.x, target.y);
-        const projectile = this.scene.add.circle(owner.x, owner.y, 6, 0x00ccff);
-        this.scene.physics.add.existing(projectile);
-        const body = projectile.body as Phaser.Physics.Arcade.Body;
-        const speed = 400;
-        body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
-        this.scene.time.delayedCall(2000, () => projectile.destroy());
-        this.scene.events.emit('player_projectile_fired', projectile, 25);
     }
 }
 
@@ -122,18 +130,23 @@ export class SnakePlayer {
         D: Phaser.Input.Keyboard.Key;
     };
     speed: number = 300;
-    positionHistory: { x: number; y: number; angle: number }[] = [];
-    maxHistoryLength: number = 200;
-    segmentDelay: number = 15;
-    private lastX: number = 0;
-    private lastY: number = 0;
+    /** Head positions, newest first. path[0] is always the current head position. */
+    path: { x: number; y: number }[] = [];
+    private spawner: ProjectileSpawner;
+    private worldBounds: Phaser.Geom.Rectangle;
 
-    constructor(scene: Phaser.Scene, x: number, y: number) {
+    constructor(
+        scene: Phaser.Scene,
+        x: number,
+        y: number,
+        spawner: ProjectileSpawner,
+        worldBounds: Phaser.Geom.Rectangle,
+    ) {
         this.scene = scene;
+        this.spawner = spawner;
+        this.worldBounds = worldBounds;
         this.head = this.scene.add.image(x, y, 'snake-head');
         this.head.setDepth(10);
-        this.lastX = x;
-        this.lastY = y;
         if (this.scene.input && this.scene.input.keyboard) {
             this.keys = this.scene.input.keyboard.addKeys('W,A,S,D') as any;
         }
@@ -141,40 +154,40 @@ export class SnakePlayer {
     }
 
     getHurtboxes(): { x: number; y: number; r: number }[] {
-        const parts = [{ x: this.head.x, y: this.head.y, r: 16 }];
+        const parts = [{ x: this.head.x, y: this.head.y, r: HEAD_RADIUS }];
         for (const seg of this.segments) {
             parts.push({ x: seg.x, y: seg.y, r: 12 });
         }
         return parts;
     }
 
+    /** Arc length of path needed to place every segment. */
+    private get bodyLength(): number {
+        return (this.segments.length + 1) * SEGMENT_SPACING;
+    }
+
     initSegments() {
         const numSegments = 4;
-        const totalDelay = numSegments * this.segmentDelay;
         this.segments.forEach(seg => seg.destroy());
         this.segments = [];
         this.weapons = [];
-        this.positionHistory = [];
-        const pixelsPerFrame = 5;
-        for (let i = 0; i <= totalDelay + 10; i++) {
-            this.positionHistory.push({
-                x: this.head.x - (i * pixelsPerFrame),
-                y: this.head.y,
-                angle: 0
-            });
+
+        // Straight line behind the head (head faces +x at start).
+        this.path = [];
+        for (let d = 0; d <= (numSegments + 1) * SEGMENT_SPACING; d += SEGMENT_SPACING) {
+            this.path.push({ x: this.head.x - d, y: this.head.y });
         }
-        this.maxHistoryLength = totalDelay + 20;
+
         for (let i = 0; i < numSegments; i++) {
-            const historyIndex = (i + 1) * this.segmentDelay;
-            const pos = this.positionHistory[historyIndex];
-            const segment = this.scene.add.image(pos.x, pos.y, 'snake-body');
+            const segment = this.scene.add.image(this.head.x - (i + 1) * SEGMENT_SPACING, this.head.y, 'snake-body');
             segment.setDepth(10 - (i + 1));
             this.segments.push(segment);
-            if (i === 0) this.weapons.push(new RapidBlaster(this.scene));
-            else if (i === 1) this.weapons.push(new AutoTurret(this.scene));
+            if (i === 0) this.weapons.push(new RapidBlaster(this.spawner));
+            else if (i === 1) this.weapons.push(new AutoTurret(this.scene, this.spawner));
             else if (i === 2) this.weapons.push(new OrbitingBlade(this.scene));
             else this.weapons.push(null);
         }
+        this.layoutSegments();
     }
 
     update(time: number, delta: number) {
@@ -192,27 +205,75 @@ export class SnakePlayer {
             vx /= length;
             vy /= length;
             const dt = delta / 1000;
-            this.head.x += vx * this.speed * dt;
-            this.head.y += vy * this.speed * dt;
+            const b = this.worldBounds;
+            this.head.x = Phaser.Math.Clamp(this.head.x + vx * this.speed * dt, b.left + HEAD_RADIUS, b.right - HEAD_RADIUS);
+            this.head.y = Phaser.Math.Clamp(this.head.y + vy * this.speed * dt, b.top + HEAD_RADIUS, b.bottom - HEAD_RADIUS);
         }
-        const headMoved = this.head.x !== this.lastX || this.head.y !== this.lastY;
-        if (headMoved) {
-            this.positionHistory.unshift({ x: this.head.x, y: this.head.y, angle: this.head.rotation });
-            if (this.positionHistory.length > this.maxHistoryLength) this.positionHistory.pop();
-            this.lastX = this.head.x;
-            this.lastY = this.head.y;
-        }
+
+        this.recordHeadPosition();
+        this.layoutSegments();
+
         for (let i = 0; i < this.segments.length; i++) {
-            const delayOffset = (i + 1) * this.segmentDelay;
-            const index = Math.min(delayOffset, this.positionHistory.length - 1);
-            const historicalPos = this.positionHistory[index];
-            if (historicalPos) {
-                this.segments[i].x = historicalPos.x;
-                this.segments[i].y = historicalPos.y;
-                this.segments[i].rotation = historicalPos.angle;
-            }
             const weapon = this.weapons[i];
             if (weapon) weapon.update(time, delta, this.segments[i]);
+        }
+    }
+
+    /** Keep path[0] at the head; commit a new point once the head has moved far enough. */
+    private recordHeadPosition() {
+        const hx = this.head.x;
+        const hy = this.head.y;
+        const last = this.path[1];
+        if (last && Phaser.Math.Distance.Between(hx, hy, last.x, last.y) < PATH_MIN_STEP) {
+            // Small move: slide the head point instead of adding a new one.
+            this.path[0].x = hx;
+            this.path[0].y = hy;
+        } else {
+            this.path[0] = { x: hx, y: hy };
+            this.path.unshift({ x: hx, y: hy });
+        }
+    }
+
+    /**
+     * Place segment i at arc length (i+1) * SEGMENT_SPACING back along the path,
+     * interpolating between recorded points, then trim the unused tail of the path.
+     */
+    private layoutSegments() {
+        const path = this.path;
+        let segIdx = 0;
+        let walked = 0; // arc length from head to path[p]
+        let p = 0;
+        while (segIdx < this.segments.length && p < path.length - 1) {
+            const a = path[p];
+            const b = path[p + 1];
+            const len = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
+            const target = (segIdx + 1) * SEGMENT_SPACING;
+            if (len > 0 && walked + len >= target) {
+                const t = (target - walked) / len;
+                const seg = this.segments[segIdx];
+                seg.x = a.x + (b.x - a.x) * t;
+                seg.y = a.y + (b.y - a.y) * t;
+                seg.rotation = Math.atan2(a.y - b.y, a.x - b.x);
+                segIdx++;
+                continue; // next segment may land on the same path piece
+            }
+            walked += len;
+            p++;
+        }
+        // Path too short (shouldn't happen): stack leftovers on the last point.
+        const end = path[path.length - 1];
+        for (; segIdx < this.segments.length; segIdx++) {
+            this.segments[segIdx].setPosition(end.x, end.y);
+        }
+
+        // Trim points beyond the body length (keep one extra piece for interpolation).
+        let acc = 0;
+        for (let i = 0; i < path.length - 1; i++) {
+            acc += Phaser.Math.Distance.Between(path[i].x, path[i].y, path[i + 1].x, path[i + 1].y);
+            if (acc > this.bodyLength + SEGMENT_SPACING) {
+                path.length = i + 2;
+                break;
+            }
         }
     }
 }

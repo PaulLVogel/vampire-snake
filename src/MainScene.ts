@@ -1,5 +1,5 @@
 import Phaser from 'phaser';
-import { SnakePlayer } from './SnakePlayer.ts';
+import { SnakePlayer, type ProjectileSpawner } from './SnakePlayer.ts';
 import { Enemy, ENEMY_CONTACT_DAMAGE, ENEMY_RADIUS } from './Enemy.ts';
 
 const WORLD = 2000;
@@ -7,10 +7,13 @@ const MAX_ENEMIES = 28;
 const SPAWN_INTERVAL_MS = 900;
 const PLAYER_MAX_HP = 100;
 const I_FRAME_MS = 450;
+const BLADE_HIT_COOLDOWN_MS = 250;
+const PROJECTILE_LIFETIME_MS = 2000;
 
-export class MainScene extends Phaser.Scene {
+export class MainScene extends Phaser.Scene implements ProjectileSpawner {
   player!: SnakePlayer;
   enemies!: Phaser.GameObjects.Group;
+  projectiles!: Phaser.Physics.Arcade.Group;
   private spawnAcc = 0;
   private playerHp = PLAYER_MAX_HP;
   private iFrameUntil = 0;
@@ -29,15 +32,26 @@ export class MainScene extends Phaser.Scene {
     this.createGridBackground();
     this.makeSnakeTextures();
 
-    this.player = new SnakePlayer(this, WORLD / 2, WORLD / 2);
+    // Enemies, projectile pool and listeners must exist before the player,
+    // because weapons are built (and emit 'blade_created') in its constructor.
+    this.enemies = this.add.group();
+    this.projectiles = this.physics.add.group({ allowGravity: false });
+    this.physics.add.overlap(this.projectiles, this.enemies, this.onProjectileHit, undefined, this);
+    this.events.on('blade_created', this.onBladeCreated, this);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.events.off('blade_created', this.onBladeCreated, this);
+    });
+
+    this.player = new SnakePlayer(
+      this,
+      WORLD / 2,
+      WORLD / 2,
+      this,
+      new Phaser.Geom.Rectangle(0, 0, WORLD, WORLD),
+    );
 
     this.cameras.main.setBounds(0, 0, WORLD, WORLD);
     this.cameras.main.startFollow(this.player.head, true, 0.1, 0.1);
-
-    this.enemies = this.add.group();
-
-    this.events.on('player_projectile_fired', this.onProjectileFired, this);
-    this.events.on('blade_created', this.onBladeCreated, this);
 
     this.hpText = this.add
       .text(20, 20, '', {
@@ -67,6 +81,7 @@ export class MainScene extends Phaser.Scene {
   update(time: number, delta: number) {
     if (this.dead) return;
     if (this.player) this.player.update(time, delta);
+    this.expireProjectiles(time);
 
     this.spawnAcc += delta;
     if (this.spawnAcc >= SPAWN_INTERVAL_MS && this.enemies.getLength() < MAX_ENEMIES) {
@@ -116,19 +131,68 @@ export class MainScene extends Phaser.Scene {
     this.enemies.add(enemy);
   }
 
-  private onProjectileFired(projectile: Phaser.GameObjects.Arc, damage: number) {
-    this.physics.add.overlap(projectile, this.enemies, (_p, enemyObj) => {
-      const enemy = enemyObj as Enemy;
-      if (!enemy.active) return;
-      projectile.destroy();
-      if (enemy.takeDamage(damage)) this.kills += 1;
-    });
+  /** ProjectileSpawner: reuse a pooled projectile, or create one if the pool is empty. */
+  fireProjectile(opts: {
+    x: number;
+    y: number;
+    angle: number;
+    speed: number;
+    radius: number;
+    color: number;
+    damage: number;
+    lifetimeMs?: number;
+  }) {
+    let p = this.projectiles.getFirstDead(false) as Phaser.GameObjects.Arc | null;
+    if (!p) {
+      p = this.add.circle(opts.x, opts.y, opts.radius, opts.color);
+      this.projectiles.add(p);
+    }
+    p.setActive(true).setVisible(true);
+    p.setRadius(opts.radius);
+    p.setFillStyle(opts.color);
+    p.setData('damage', opts.damage);
+    p.setData('expiresAt', this.time.now + (opts.lifetimeMs ?? PROJECTILE_LIFETIME_MS));
+
+    const body = p.body as Phaser.Physics.Arcade.Body;
+    body.enable = true;
+    body.setCircle(opts.radius);
+    body.reset(opts.x, opts.y);
+    body.setVelocity(Math.cos(opts.angle) * opts.speed, Math.sin(opts.angle) * opts.speed);
   }
 
+  private releaseProjectile(p: Phaser.GameObjects.Arc) {
+    const body = p.body as Phaser.Physics.Arcade.Body;
+    body.stop();
+    body.enable = false;
+    p.setActive(false).setVisible(false);
+  }
+
+  private expireProjectiles(time: number) {
+    for (const child of this.projectiles.getChildren()) {
+      const p = child as Phaser.GameObjects.Arc;
+      if (p.active && time >= (p.getData('expiresAt') as number)) this.releaseProjectile(p);
+    }
+  }
+
+  private onProjectileHit: Phaser.Types.Physics.Arcade.ArcadePhysicsCallback = (a, b) => {
+    // Arcade doesn't guarantee argument order for group-vs-group overlaps.
+    const [enemy, p] = (a instanceof Enemy ? [a, b] : [b, a]) as [Enemy, Phaser.GameObjects.Arc];
+    // A projectile can overlap two enemies in the same step; only the first counts.
+    if (!p.active || !enemy.active) return;
+    this.releaseProjectile(p);
+    if (enemy.takeDamage(p.getData('damage') as number)) this.kills += 1;
+  };
+
   private onBladeCreated(blade: Phaser.GameObjects.Rectangle, damage: number) {
-    this.physics.add.overlap(blade, this.enemies, (_b, enemyObj) => {
-      const enemy = enemyObj as Enemy;
-      if (!enemy.active) return;
+    // Arcade overlap fires every frame while touching; limit hits per enemy.
+    const lastHit = new WeakMap<Enemy, number>();
+    this.physics.add.overlap(blade, this.enemies, (a, b) => {
+      const enemy = (a instanceof Enemy ? a : b) as Enemy;
+      if (!(enemy instanceof Enemy) || !enemy.active) return;
+      const now = this.time.now;
+      const prev = lastHit.get(enemy);
+      if (prev !== undefined && now - prev < BLADE_HIT_COOLDOWN_MS) return;
+      lastHit.set(enemy, now);
       if (enemy.takeDamage(damage)) this.kills += 1;
     });
   }
